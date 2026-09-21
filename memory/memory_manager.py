@@ -17,6 +17,9 @@ _lock            = Lock()
 MAX_VALUE_LENGTH = 380
 MEMORY_MAX_CHARS = 2200
 
+# ── In-memory cache — eliminates repeated disk reads on every hot-path call ───
+_memory_cache: dict | None = None  # None = not loaded yet
+
 def _empty_memory() -> dict:
     return {
         "identity":      {},
@@ -28,9 +31,17 @@ def _empty_memory() -> dict:
     }
 
 def load_memory() -> dict:
+    global _memory_cache
+    # Return cached copy if available — avoid repeated disk reads
+    if _memory_cache is not None:
+        return _memory_cache
     if not MEMORY_PATH.exists():
-        return _empty_memory()
+        _memory_cache = _empty_memory()
+        return _memory_cache
     with _lock:
+        # Double-check after acquiring lock
+        if _memory_cache is not None:
+            return _memory_cache
         try:
             data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -38,11 +49,14 @@ def load_memory() -> dict:
                 for key in base:
                     if key not in data:
                         data[key] = {}
-                return data
-            return _empty_memory()
+                _memory_cache = data
+                return _memory_cache
+            _memory_cache = _empty_memory()
+            return _memory_cache
         except Exception as e:
             print(f"[Memory] ⚠️ Load error: {e}")
-            return _empty_memory()
+            _memory_cache = _empty_memory()
+            return _memory_cache
 
 def _all_entries(memory: dict) -> list[tuple]:
     entries = []
@@ -68,6 +82,7 @@ def _trim_to_limit(memory: dict) -> dict:
     return memory
 
 def save_memory(memory: dict) -> None:
+    global _memory_cache
     if not isinstance(memory, dict):
         return
     memory = _trim_to_limit(memory)
@@ -77,6 +92,7 @@ def save_memory(memory: dict) -> None:
             json.dumps(memory, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        _memory_cache = memory  # keep cache in sync after write
 
 
 def _truncate_value(val: str) -> str:
@@ -222,6 +238,7 @@ _SESSION_MAX = 3   # safety cap — in practice 0-1 entries after pop
 
 def save_session_summary(summary: str, language: str = "") -> None:
     """Append a 1-2 sentence session summary to long_term.json['sessions']."""
+    global _memory_cache
     summary = (summary or "").strip()
     if not summary:
         return
@@ -243,6 +260,7 @@ def save_session_summary(summary: str, language: str = "") -> None:
             json.dumps(memory, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        _memory_cache = memory  # keep cache in sync
     print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
 
 
@@ -251,6 +269,7 @@ def pop_last_session() -> dict | None:
     Return AND remove the most recent session entry.
     Calling this consumes the entry so it is never repeated in future briefings.
     """
+    global _memory_cache
     with _lock:
         if not MEMORY_PATH.exists():
             return None
@@ -265,6 +284,7 @@ def pop_last_session() -> dict | None:
                 json.dumps(memory, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            _memory_cache = memory  # keep cache in sync
             return entry
         except Exception as e:
             print(f"[Memory] ⚠️ pop_last_session error: {e}")

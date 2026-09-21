@@ -1,4 +1,6 @@
 #computer_settings.py
+import base64
+import io
 import json
 import re
 import sys
@@ -374,6 +376,7 @@ def type_text(text: str, press_enter_after: bool = False):
         pyautogui.press("enter")
 
 def take_screenshot():
+    """Open the OS screenshot tool (user-facing snip / clipboard)."""
     if _OS == "Windows":
         pyautogui.hotkey("win", "shift", "s")
     elif _OS == "Darwin":
@@ -384,6 +387,73 @@ def take_screenshot():
                 subprocess.Popen(cmd)
                 return
         pyautogui.hotkey("ctrl", "print_screen")
+
+
+def capture_screenshot_programmatic(save_path: Path = None) -> tuple[bytes, str] | None:
+    """
+    Silently capture the primary screen using `mss` and return
+    (png_bytes, saved_path_str). Saves to *save_path* if provided.
+    Returns None on failure.
+    """
+    try:
+        import mss
+        import mss.tools
+    except ImportError:
+        print("[Settings] mss not installed — run: pip install mss")
+        return None
+    try:
+        with mss.mss() as sct:
+            monitors = sct.monitors
+            target   = monitors[1] if len(monitors) > 1 else monitors[0]
+            shot     = sct.grab(target)
+            png      = mss.tools.to_png(shot.rgb, shot.size)
+        if save_path:
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(png)
+        return png, (str(save_path) if save_path else "")
+    except Exception as e:
+        print(f"[Settings] Programmatic screenshot failed: {e}")
+        return None
+
+
+def get_battery_status() -> str:
+    """Return a human-readable battery status string."""
+    try:
+        import psutil
+        bat = psutil.sensors_battery()
+        if bat is None:
+            return "No battery detected (desktop PC)."
+        pct   = bat.percent
+        plugged = bat.power_plugged
+        secs  = bat.secsleft
+        if plugged:
+            status = "charging" if pct < 100 else "fully charged"
+        else:
+            status = "discharging"
+        if secs and secs > 0 and not plugged:
+            mins = int(secs // 60)
+            h, m = divmod(mins, 60)
+            time_str = f"{h}h {m}m remaining" if h else f"{m}m remaining"
+        else:
+            time_str = "plugged in" if plugged else ""
+        return f"Battery: {pct:.0f}% — {status}" + (f", {time_str}" if time_str else ".")
+    except Exception as e:
+        return f"Could not read battery: {e}"
+
+
+def sleep_computer():
+    """Suspend / sleep the computer."""
+    if _OS == "Windows":
+        # /h = hibernate; for sleep use rundll32
+        subprocess.Popen(
+            ["rundll32.exe", "powrprof.dll,SetSuspendState", "0", "1", "0"],
+            **_WIN_HIDE
+        )
+    elif _OS == "Darwin":
+        subprocess.run(["pmset", "sleepnow"], capture_output=True)
+    else:
+        subprocess.run(["systemctl", "suspend"], capture_output=True)
 
 def lock_screen():
     if _OS == "Windows":
@@ -530,6 +600,10 @@ ACTION_MAP: dict[str, callable] = {
     "brightness_down":     brightness_down,
     "sleep_display":       sleep_display,
     "screen_off":          sleep_display,
+    "sleep":               sleep_computer,
+    "sleep_computer":      sleep_computer,
+    "suspend":             sleep_computer,
+    "hibernate":           sleep_computer,
     "pause_video":         pause_video,
     "play_pause":          pause_video,
     "close_app":           close_app,
@@ -582,7 +656,7 @@ ACTION_MAP: dict[str, callable] = {
     "shutdown":            shutdown_computer,
 }
 
-_DANGEROUS_ACTIONS = {"restart", "shutdown"}
+_DANGEROUS_ACTIONS = {"restart", "shutdown", "sleep", "sleep_computer", "suspend", "hibernate"}
 
 
 
@@ -625,10 +699,13 @@ def computer_settings(
     response=None,
     player=None,
     session_memory=None,
+    dashboard=None,
 ) -> str:
-    if not _PYAUTOGUI:
-        return "pyautogui is not installed. Run: pip install pyautogui"
-
+    """
+    Main computer-control dispatcher.
+    `player`    — JarvisUI instance (for write_log / show_content).
+    `dashboard` — DashboardServer instance (for screenshot broadcasting).
+    """
     params      = parameters or {}
     raw_action  = params.get("action", "").strip()
     description = params.get("description", "").strip()
@@ -644,6 +721,19 @@ def computer_settings(
 
     if not action:
         return "No action could be determined."
+
+    # Battery status — no pyautogui needed, handle early
+    if action in ("battery", "battery_status", "get_battery", "battery_percentage",
+                  "battery_level", "check_battery"):
+        return get_battery_status()
+
+    # Programmatic screenshot for dashboard display
+    if action in ("screenshot_dashboard", "capture_screen", "show_screenshot",
+                  "screenshot_display", "display_screenshot"):
+        return _handle_dashboard_screenshot(player=player, dashboard=dashboard)
+
+    if not _PYAUTOGUI:
+        return "pyautogui is not installed. Run: pip install pyautogui"
 
     print(f"[Settings] Action: {action}  Value: {value}  OS: {_OS}")
     if player:
@@ -699,8 +789,62 @@ def computer_settings(
         return f"Unknown action: '{raw_action}'."
 
     try:
-        func()
-        return f"Done: {action}."
+        result = func()
+        # If this was a screenshot action, also try to broadcast to dashboard
+        if action == "screenshot" and dashboard:
+            _broadcast_screenshot_async(dashboard=dashboard, player=player)
+        return result if isinstance(result, str) else f"Done: {action}."
     except Exception as e:
         print(f"[Settings] Action failed ({action}): {e}")
         return f"Action failed ({action}): {e}"
+
+
+# ── Dashboard screenshot helpers ───────────────────────────────────────────────
+
+def _get_dashboard_static_dir() -> Path:
+    """Return the dashboard/static directory relative to this file."""
+    return Path(__file__).resolve().parent.parent / "dashboard" / "static"
+
+
+def _handle_dashboard_screenshot(player=None, dashboard=None) -> str:
+    """Take a programmatic screenshot, save it, and broadcast to dashboard."""
+    static_dir = _get_dashboard_static_dir()
+    save_path  = static_dir / "latest_screenshot.png"
+    res = capture_screenshot_programmatic(save_path=save_path)
+    if res is None:
+        return "Screenshot capture failed. Make sure 'mss' is installed: pip install mss"
+    png_bytes, _ = res
+    if dashboard:
+        _broadcast_screenshot_async(dashboard=dashboard, player=player, png_bytes=png_bytes)
+    if player and hasattr(player, "write_log"):
+        player.write_log("[Screenshot] Captured and sent to dashboard.")
+    return "Screenshot captured and displayed on the dashboard."
+
+
+def _broadcast_screenshot_async(dashboard, player=None, png_bytes: bytes = None) -> None:
+    """Fire-and-forget: broadcast screenshot to dashboard WebSocket clients."""
+    import asyncio
+    import threading
+
+    if png_bytes is None:
+        static_dir = _get_dashboard_static_dir()
+        save_path  = static_dir / "latest_screenshot.png"
+        # Brief delay so OS screenshot tool has time to save
+        time.sleep(1.5)
+        res = capture_screenshot_programmatic(save_path=save_path)
+        if res is None:
+            return
+        png_bytes, _ = res
+
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    msg = {"type": "screenshot", "data": b64, "mime": "image/png"}
+
+    def _send():
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(dashboard.broadcast(msg))
+            loop.close()
+        except Exception as e:
+            print(f"[Settings] Screenshot broadcast error: {e}")
+
+    threading.Thread(target=_send, daemon=True, name="ScreenshotBroadcast").start()

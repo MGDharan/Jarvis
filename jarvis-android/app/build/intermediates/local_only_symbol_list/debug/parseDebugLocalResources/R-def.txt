@@ -1,0 +1,23 @@
+R_DEF: Internal format may change without notice
+local
+color jarvis_bg
+color jarvis_blue
+color jarvis_card
+color jarvis_card_border
+color jarvis_cyan
+color jarvis_danger
+color jarvis_online
+color jarvis_text
+color jarvis_text_dim
+color jarvis_warning
+string app_name
+string ask_jarvis
+string connecting
+string hold_to_talk
+string lab_offline
+string lab_online
+string listening
+string pair_qr_title
+string scan_qr_prompt
+style Theme.JarvisRemote
+xml network_security_config

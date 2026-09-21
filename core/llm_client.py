@@ -42,21 +42,33 @@ CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",
     "llm_model":    "llama3.2",
-    "llm_provider": "ollama",   # "ollama" | "openai"
+    "llm_provider": "ollama",   # "ollama" | "openai" | "gemini"
 }
+
+# ── Config cache — eliminates two file reads per LLM call ─────────────────────
+_config_cache: dict | None = None
+_config_mtime: float = 0.0
+
+def _load_config() -> dict:
+    global _config_cache, _config_mtime
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+        if _config_cache is not None and mtime == _config_mtime:
+            return _config_cache
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        _config_cache = data
+        _config_mtime = mtime
+        return _config_cache
+    except Exception:
+        return _config_cache or {}
 
 
 def get_llm_provider() -> str:
-    """Returns 'ollama' or 'openai' (covers LM Studio, LocalAI, Jan, etc.)."""
+    """Returns 'ollama', 'openai', or 'gemini'."""
     raw = _load_config().get("llm_provider", "ollama").strip().lower()
+    if raw == "gemini":
+        return "gemini"
     return "openai" if raw in ("openai", "lmstudio", "localai", "jan", "llamacpp") else "ollama"
-
-
-def _load_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
 
 
 def ensure_ollama_running(timeout: int = 15) -> bool:
@@ -294,6 +306,15 @@ def call_llm(
     """
     url, model = get_llm_settings()
     provider   = get_llm_provider()
+
+    if provider == "gemini":
+        content_parts = []
+        for event in _stream_gemini(messages, timeout):
+            if event.get("type") == "done":
+                return {"content": event.get("content", ""), "tool_calls": event.get("tool_calls", [])}
+            elif event.get("type") == "sentence":
+                content_parts.append(event.get("text", ""))
+        return {"content": " ".join(content_parts).strip(), "tool_calls": []}
 
     if provider == "openai":
         endpoint = f"{url}/v1/chat/completions"
@@ -548,13 +569,78 @@ def _stream_openai(
         raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
 
 
+def _stream_gemini(
+    messages: list,
+    timeout:  int,
+) -> Generator[dict, None, None]:
+    """
+    Streaming backend using the google-genai SDK (Gemini Flash / Pro).
+    Yields the same {type, text} / {type, done, content, tool_calls} events
+    as the Ollama and OpenAI backends.
+    """
+    try:
+        from google import genai as _genai  # type: ignore
+    except ImportError:
+        raise RuntimeError("google-genai package not installed. Run: pip install google-generativeai")
+
+    cfg = _load_config()
+    api_key = cfg.get("gemini_api_key", "").strip()
+    if not api_key:
+        raise RuntimeError("gemini_api_key is not set in config/api_keys.json")
+
+    model = cfg.get("llm_model", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+
+    # Convert OpenAI-style messages to Gemini parts
+    system_parts = []
+    user_parts   = []
+    for m in messages:
+        role    = m.get("role", "")
+        content = m.get("content", "") or ""
+        if role == "system":
+            system_parts.append(content)
+        else:
+            user_parts.append(content)
+
+    prompt = "\n\n".join(system_parts + user_parts)
+
+    client = _genai.Client(api_key=api_key)
+    full_content = ""
+    buf = ""
+    try:
+        for chunk in client.models.generate_content_stream(
+            model=model,
+            contents=prompt,
+        ):
+            delta = (chunk.text or "") if hasattr(chunk, "text") else ""
+            if not delta:
+                continue
+            full_content += delta
+            buf          += delta
+            while True:
+                m2 = _SENT_END.search(buf)
+                if not m2:
+                    break
+                sentence = buf[: m2.start() + 1].strip()
+                buf      = buf[m2.end() :]
+                if sentence:
+                    yield {"type": "sentence", "text": sentence}
+
+        if buf.strip():
+            yield {"type": "sentence", "text": buf.strip()}
+
+        yield {"type": "done", "content": full_content.strip(), "tool_calls": []}
+
+    except Exception as e:
+        raise RuntimeError(f"Gemini stream failed: {e}")
+
+
 def call_llm_stream(
     messages: list,
     tools:    list | None = None,
     timeout:  int = 120,
 ) -> Generator[dict, None, None]:
     """
-    Streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
+    Streaming chat request.  Routes to Gemini, Ollama, or OpenAI-compatible backend.
 
     Yields:
         {"type": "sentence", "text": str}   — each complete sentence as it arrives
@@ -564,6 +650,9 @@ def call_llm_stream(
     Tool calls always appear in the final "done" event.
     """
     provider = get_llm_provider()
+    if provider == "gemini":
+        yield from _stream_gemini(messages, timeout)
+        return
     if provider == "openai":
         yield from _stream_openai(messages, tools, timeout)
         return

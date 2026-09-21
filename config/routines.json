@@ -1,0 +1,18 @@
+[
+  {
+    "id": "weekday_morning_brief",
+    "name": "Weekday morning briefing",
+    "enabled": true,
+    "weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "time": "08:00",
+    "city": "Istanbul",
+    "include_weather": true,
+    "include_calendar": true
+  }
+]

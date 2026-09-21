@@ -1,0 +1,232 @@
+{
+    "version": 1,
+    "updated_at": "2026-09-16T09:28:12.949202",
+    "devices": {
+        "dev_579bccf0cba5": {
+            "device_id": "dev_579bccf0cba5",
+            "device_name": "Test Pixel Phone",
+            "device_model": "Android 14",
+            "token_hash": "59d44acbd9a7d81a596d36d981c2243cef5ab7ebd0364eb8b70b43962b7a9afe",
+            "created_at": "2026-09-14T20:24:33.161994",
+            "last_seen_at": "2026-09-14T20:24:33.164018",
+            "last_ip": "192.168.1.50",
+            "status": "authorized",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            }
+        },
+        "dev_a163efa456be": {
+            "device_id": "dev_a163efa456be",
+            "device_name": "Revoke Test Phone",
+            "device_model": "Android",
+            "token_hash": "4ab7553fed9f23141d3d97f47a5fd9a184b2334ef0a1cfd7210248dc8e07c0cf",
+            "created_at": "2026-09-14T20:24:33.164987",
+            "last_seen_at": "2026-09-14T20:24:33.166678",
+            "last_ip": "127.0.0.1",
+            "status": "revoked",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            },
+            "revoked_at": "2026-09-14T20:24:33.167847",
+            "revocation_reason": "Test revocation"
+        },
+        "dev_a9eb4b037488": {
+            "device_id": "dev_a9eb4b037488",
+            "device_name": "Test Pixel Phone",
+            "device_model": "Android 14",
+            "token_hash": "85bc2bad82c0b24a4c94bda552d42bba791fd74205224c4be6f4a870eb659669",
+            "created_at": "2026-09-14T20:30:30.476028",
+            "last_seen_at": "2026-09-14T20:30:30.476028",
+            "last_ip": "192.168.1.50",
+            "status": "authorized",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            }
+        },
+        "dev_9943e882eab9": {
+            "device_id": "dev_9943e882eab9",
+            "device_name": "Revoke Test Phone",
+            "device_model": "Android",
+            "token_hash": "e1fc3d3de9c2b07caabd186baa0080626ac92c9dd66ed806f7f229993d48a1d2",
+            "created_at": "2026-09-14T20:30:30.477452",
+            "last_seen_at": "2026-09-14T20:30:30.479141",
+            "last_ip": "127.0.0.1",
+            "status": "revoked",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            },
+            "revoked_at": "2026-09-14T20:30:30.480232",
+            "revocation_reason": "Test revocation"
+        },
+        "dev_9f0400420f1c": {
+            "device_id": "dev_9f0400420f1c",
+            "device_name": "E2E Test Android Phone",
+            "device_model": "Pixel 8",
+            "token_hash": "9bf39c82c4dae2e8b2a95b4ca38d9c6ff6f47716682e86be089dd087d9ca1ee1",
+            "created_at": "2026-09-14T20:30:30.525142",
+            "last_seen_at": "2026-09-14T20:30:30.527385",
+            "last_ip": "testclient",
+            "status": "revoked",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            },
+            "revoked_at": "2026-09-14T20:30:30.532648",
+            "revocation_reason": "User revoked"
+        },
+        "dev_a21c36918a0f": {
+            "device_id": "dev_a21c36918a0f",
+            "device_name": "Test Pixel Phone",
+            "device_model": "Android 14",
+            "token_hash": "dd5d097bd3292afd0d134360792d16de4bcb8f288cc3c13044d6bc4fc0590552",
+            "created_at": "2026-09-14T20:30:59.297397",
+            "last_seen_at": "2026-09-14T20:30:59.300936",
+            "last_ip": "192.168.1.50",
+            "status": "authorized",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            }
+        },
+        "dev_a3eaa4ad170c": {
+            "device_id": "dev_a3eaa4ad170c",
+            "device_name": "Revoke Test Phone",
+            "device_model": "Android",
+            "token_hash": "79b32c8b423fb9c7f14d5dc3dbc2c4bdb3bc1487ae243af8b98b00cab1fe9fa3",
+            "created_at": "2026-09-14T20:30:59.302208",
+            "last_seen_at": "2026-09-14T20:30:59.305141",
+            "last_ip": "127.0.0.1",
+            "status": "revoked",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            },
+            "revoked_at": "2026-09-14T20:30:59.306362",
+            "revocation_reason": "Test revocation"
+        },
+        "dev_244bf33f15d6": {
+            "device_id": "dev_244bf33f15d6",
+            "device_name": "E2E Test Android Phone",
+            "device_model": "Pixel 8",
+            "token_hash": "8ad43db54a4f8cabe23fcfdeca1b674135cd22a041c6a988ca4b16db84fce11f",
+            "created_at": "2026-09-14T20:30:59.398247",
+            "last_seen_at": "2026-09-14T20:30:59.406246",
+            "last_ip": "testclient",
+            "status": "revoked",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            },
+            "revoked_at": "2026-09-14T20:30:59.418251",
+            "revocation_reason": "User revoked"
+        },
+        "dev_b423affb1576": {
+            "device_id": "dev_b423affb1576",
+            "device_name": "Test CLI",
+            "device_model": "Simulator",
+            "token_hash": "ca75726a66880027163d30fed6b3a2bd41080b9de84e55384b4d59b0ef523ce5",
+            "created_at": "2026-09-14T20:52:44.282341",
+            "last_seen_at": "2026-09-14T20:52:44.282341",
+            "last_ip": "127.0.0.1",
+            "status": "authorized",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            }
+        },
+        "dev_bf992ab311a8": {
+            "device_id": "dev_bf992ab311a8",
+            "device_name": "Terminal Test Phone (CLI)",
+            "device_model": "Simulator",
+            "token_hash": "80825173f5ef641b0ac150406c7a4a743eb356152e272da6ddc2b4d9854335dd",
+            "created_at": "2026-09-14T20:53:44.241156",
+            "last_seen_at": "2026-09-14T20:54:21.424435",
+            "last_ip": "127.0.0.1",
+            "status": "authorized",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            }
+        },
+        "dev_7cf691a57c3b": {
+            "device_id": "dev_7cf691a57c3b",
+            "device_name": "Terminal Test Phone (CLI)",
+            "device_model": "Simulator",
+            "token_hash": "62d77f0978784745001f393e9e8d9b4ddcc69527285673591e8fb3910820df03",
+            "created_at": "2026-09-14T21:06:24.503997",
+            "last_seen_at": "2026-09-14T21:08:46.147502",
+            "last_ip": "127.0.0.1",
+            "status": "authorized",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            }
+        },
+        "dev_fe8d03a3298a": {
+            "device_id": "dev_fe8d03a3298a",
+            "device_name": "Xiaomi 22101316I",
+            "device_model": "Android 14",
+            "token_hash": "112e6a5362219886ec498520cd278ebb818483a62542649cd5ff276df02ff913",
+            "created_at": "2026-09-14T23:44:34.841034",
+            "last_seen_at": "2026-09-16T09:28:12.948203",
+            "last_ip": "10.184.135.96",
+            "status": "authorized",
+            "permissions": {
+                "voice": true,
+                "files_search": true,
+                "files_download": true,
+                "system_status": true,
+                "app_control": true,
+                "shutdown": true
+            }
+        }
+    }
+}

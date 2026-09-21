@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">JARVIS</string>
+    <string name="lab_online">LAB ONLINE</string>
+    <string name="lab_offline">LAB OFFLINE</string>
+    <string name="connecting">CONNECTING</string>
+    <string name="hold_to_talk">HOLD TO TALK</string>
+    <string name="listening">LISTENING…</string>
+    <string name="ask_jarvis">Ask JARVIS…</string>
+    <string name="pair_qr_title">Pair with Lab Laptop</string>
+    <string name="scan_qr_prompt">Scan the QR code displayed on your JARVIS laptop screen</string>
+</resources>

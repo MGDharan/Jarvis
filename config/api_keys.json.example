@@ -1,4 +1,4 @@
-﻿{
+{
     "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
     "os_system": "windows",
     "camera_index": 0,
@@ -11,5 +11,9 @@
     },
     "assistant_name": "JARVIS",
     "user_name": "User",
-    "ui_color": "#00d4ff"
+    "ui_color": "#00d4ff",
+    "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN_FROM_BOTFATHER",
+    "telegram_chat_id": "",
+    "telegram_pair_code": "JARVIS123",
+    "discord_webhook_url": ""
 }

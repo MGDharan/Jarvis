@@ -465,6 +465,8 @@ class DashboardServer:
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
         self._connect_callback            = None
+        self._plugin_registry             = None
+        self._routine_callback            = None
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
@@ -519,6 +521,12 @@ class DashboardServer:
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
 
+    def set_plugin_registry(self, registry) -> None:
+        self._plugin_registry = registry
+
+    def set_routine_callback(self, fn) -> None:
+        self._routine_callback = fn
+
     # ── broadcast ────────────────────────────────────────────────────────
 
     async def broadcast(self, msg: dict) -> None:
@@ -549,7 +557,12 @@ class DashboardServer:
                 return FileResponse(str(_CRYPTOJS_FILE),
                                     media_type="application/javascript")
             from fastapi.responses import RedirectResponse
-            return RedirectResponse(_CRYPTOJS_CDN)
+        @app.get("/static/latest_screenshot.png")
+        async def serve_latest_screenshot():
+            sc_path = STATIC_DIR / "latest_screenshot.png"
+            if sc_path.exists():
+                return FileResponse(str(sc_path), media_type="image/png")
+            return JSONResponse({"error": "No screenshot available"}, status_code=404)
 
         @app.get("/login", response_class=HTMLResponse)
         async def login_page():
@@ -689,6 +702,64 @@ class DashboardServer:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             if self._wake_callback:
                 self._wake_callback()
+            return JSONResponse({"ok": True})
+
+        @app.get("/api/plugins")
+        async def plugins_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({"plugins": self._plugin_registry.list_for_ui() if self._plugin_registry else []})
+
+        @app.post("/api/plugins/{plugin_name}/toggle")
+        async def plugin_toggle_ep(plugin_name: str, req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            from memory.config_manager import get_plugin_enabled, save_plugin_enabled
+            if not self._plugin_registry or not self._plugin_registry.has(plugin_name):
+                return JSONResponse({"error": "Plugin not found"}, status_code=404)
+            enabled = not get_plugin_enabled(plugin_name)
+            save_plugin_enabled(plugin_name, enabled)
+            await self.broadcast({"type": "sys", "text": f"Plugin {plugin_name}: {'enabled' if enabled else 'disabled'}"})
+            return JSONResponse({"ok": True, "enabled": enabled})
+
+        @app.get("/api/routines")
+        async def routines_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            from actions.routines import list_routines
+            return JSONResponse({"routines": list_routines()})
+
+        @app.post("/api/routines")
+        async def save_routine_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            from actions.routines import save_routine
+            try:
+                routine = save_routine(await req.json())
+            except Exception as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            return JSONResponse({"ok": True, "routine": routine})
+
+        @app.post("/api/routines/{routine_id}/toggle")
+        async def routine_toggle_ep(routine_id: str, req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            from actions.routines import list_routines, set_routine_enabled
+            current = next((r for r in list_routines() if r.get("id") == routine_id), None)
+            if current is None or not set_routine_enabled(routine_id, not current.get("enabled", True)):
+                return JSONResponse({"error": "Routine not found"}, status_code=404)
+            return JSONResponse({"ok": True, "enabled": not current.get("enabled", True)})
+
+        @app.post("/api/routines/{routine_id}/run")
+        async def routine_run_ep(routine_id: str, req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            from actions.routines import build_briefing, list_routines
+            routine = next((r for r in list_routines() if r.get("id") == routine_id), None)
+            if routine is None:
+                return JSONResponse({"error": "Routine not found"}, status_code=404)
+            if self._routine_callback:
+                self._routine_callback(build_briefing(routine))
             return JSONResponse({"ok": True})
 
         # ── Phone mic real-time audio → Gemini Live ──────────────────────────
@@ -873,12 +944,27 @@ class DashboardServer:
         if use_ssl:
             asyncio.create_task(self._serve_alias())
 
-        cfg = uvicorn.Config(
-            self.app, host="0.0.0.0", port=PORT, log_level="warning",
-            **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
-        )
-
         proto = "https" if use_ssl else "http"
-        print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
-        print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        ssl_kwargs = {"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}
+
+        # Try PORT, PORT+1 ... PORT+9 to survive stale processes holding the socket.
+        import socket as _socket
+        for _port in range(PORT, PORT + 10):
+            try:
+                _probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                _probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                _probe.bind(("0.0.0.0", _port))
+                _probe.close()
+            except OSError:
+                print(f"[Dashboard] Port {_port} busy - trying {_port + 1}...")
+                continue
+
+            cfg = uvicorn.Config(
+                self.app, host="0.0.0.0", port=_port, log_level="warning", **ssl_kwargs,
+            )
+            print(f"[Dashboard] {proto}://{self._ip}:{_port}")
+            print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
+            await uvicorn.Server(cfg).serve()
+            return
+
+        print("[Dashboard] Ports 8000-8009 all busy. Kill stale JARVIS and retry.")

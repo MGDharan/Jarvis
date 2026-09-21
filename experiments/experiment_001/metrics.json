@@ -1,0 +1,16 @@
+{
+  "validation": {
+    "mae": 249.791355,
+    "rmse": 288.558112
+  },
+  "test": {
+    "mae": 250.636609,
+    "rmse": 289.191534
+  },
+  "split_sizes": {
+    "train": 800000,
+    "validation": 100000,
+    "test": 100000
+  },
+  "training_time_seconds": 6.503
+}

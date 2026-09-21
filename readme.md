@@ -16,6 +16,9 @@ An autonomous, multi-modal personal AI assistant capable of real-time voice conv
 - **🚁 Drone Flight Control Plugin**: Autonomous physical and simulated drone control for KY-UFO drones with automatic calibration and countdown sequence.
 - **🖥️ Desktop & OS Automation**: Full control over windows, system volume, browser navigation, YouTube, files, apps, and hardware telemetry.
 - **🧩 Zero-Code Plugin Engine**: Drop any .py file into plugins/ and JARVIS dynamically registers the skill on launch with crash isolation.
+- **⏰ Scheduled Routines**: Weekday morning weather and calendar briefings persist in `config/routines.json` and can run through Gemini or Ollama.
+- **📱 Remote Controls**: The dashboard can enable/disable plugins, run routines, and send commands while Gemini is offline.
+- **👁️ Screen Awareness**: Ask “What am I looking at?” to send the current screen to the vision session for analysis.
 
 ---
 
@@ -98,6 +101,8 @@ Edit config/api_keys.json:
    `powershell
    ollama serve
    `
+
+When Gemini Live is unavailable, dashboard and text commands automatically use the configured Ollama model. The default routine is weekdays at 08:00 for Istanbul; edit `config/routines.json` or use the dashboard controls to change it. Calendar events are read from Outlook when available.
 
 ### 6. Setup VB-Audio Virtual Cable (for WhatsApp Voice Bridge)
 

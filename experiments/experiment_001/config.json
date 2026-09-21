@@ -1,0 +1,25 @@
+{
+  "experiment_id": "experiment_001",
+  "workspace_id": "5e8610cf",
+  "dataset": "sales.csv",
+  "algorithm": "xgboost",
+  "task": "regression",
+  "target": "amount",
+  "features": null,
+  "split": {
+    "test": 0.1,
+    "validation": 0.1,
+    "train": 0.8
+  },
+  "metrics": [
+    "mae",
+    "rmse"
+  ],
+  "random_state": 42,
+  "preprocessing": {
+    "missing_values": "auto",
+    "categorical_encoding": "auto",
+    "scaling": "auto"
+  },
+  "timestamp": "2026-09-12 11:55:00"
+}

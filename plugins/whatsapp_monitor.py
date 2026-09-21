@@ -1,233 +1,361 @@
+"""
+WhatsApp Monitor Plugin — UIA-based (no Windows notification polling).
+
+How it works:
+  1. Finds the WhatsApp Desktop Chrome window via win32gui.
+  2. Every 3 seconds, walks the UIA DataGridControl "Chat list" and reads
+     DataItemControl names — items prefixed with "N unread message(s)" are new.
+  3. For each new unread sender (not seen before this session), generates a
+     contextual AI reply via Gemini, then sends it via _send_whatsapp().
+  4. Notifies the user through JARVIS speech (plugin_say / player.request_say).
+
+Dependencies (already in requirements.txt):
+  uiautomation, pywin32, pyautogui, pyperclip, google-genai
+"""
+
+import json
+import re
 import threading
 import time
-import asyncio
-import sys
-import json
 from pathlib import Path
 
+# ── optional deps — fail gracefully ──────────────────────────────────────────
 try:
-    from google import genai
-    _GENAI_AVAILABLE = True
+    import win32gui as _win32gui
+    _WIN32_OK = True
 except ImportError:
-    _GENAI_AVAILABLE = False
+    _WIN32_OK = False
 
-# Add core actions to path so we can reuse Mark-LI's built-in send_message
+try:
+    import uiautomation as _auto
+    _UIA_OK = True
+except ImportError:
+    _UIA_OK = False
+
+try:
+    from google import genai as _genai
+    _GENAI_OK = True
+except ImportError:
+    _GENAI_OK = False
+
+# Reuse the project's own WhatsApp send helper
+import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 try:
     from actions.send_message import _send_whatsapp
+    _SEND_OK = True
 except ImportError:
-    _send_whatsapp = None
+    _SEND_OK = False
 
-# Try importing winsdk for native Windows Notification reading
-try:
-    from winsdk.windows.ui.notifications.management import UserNotificationListener
-    from winsdk.windows.ui.notifications import NotificationKinds
-    _WINSDK_AVAILABLE = True
-except ImportError:
-    _WINSDK_AVAILABLE = False
-
-
+# ── PLUGIN manifest ───────────────────────────────────────────────────────────
 PLUGIN = {
     "name": "whatsapp_monitor",
     "description": (
-        "Turn on or off the WhatsApp auto-responder. "
-        "When active, Jarvis will read Windows System Notifications for WhatsApp messages, "
-        "generate a smart AI response based on the message content, and automatically send it."
+        "Turns WhatsApp auto-reply monitoring on or off. "
+        "When active, JARVIS watches incoming WhatsApp messages and sends a smart "
+        "AI reply on the user's behalf. "
+        "Trigger phrases: 'monitor my WhatsApp', 'watch my WhatsApp', "
+        "'start WhatsApp monitor', 'auto-reply WhatsApp', "
+        "'handle my WhatsApp messages', 'stop WhatsApp monitor', "
+        "'turn off WhatsApp auto-reply', 'I am busy reply to whatsapp'. "
+        "Always call this tool — never say you cannot monitor WhatsApp."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "status": {
                 "type": "STRING",
-                "description": "'on' to start monitoring, 'off' to stop monitoring."
-            }
+                "description": "'on' to start monitoring, 'off' to stop.",
+            },
+            "reply_instruction": {
+                "type": "STRING",
+                "description": (
+                    "Optional custom instruction for how to reply, e.g. "
+                    "'tell them I am busy', 'say I will call back later'. "
+                    "If omitted, a polite busy-reply is used."
+                ),
+            },
         },
         "required": ["status"],
     },
 }
 
-_monitor_thread = None
+# ── module-level state ────────────────────────────────────────────────────────
+_monitor_thread: threading.Thread | None = None
 _monitoring_active = False
-_replied_notification_ids = set()
+_stop_event = threading.Event()
 
-def _generate_dynamic_reply(sender, message):
-    if not _GENAI_AVAILABLE:
-        return f"Hello, I am Jarvis, Deepak's AI assistant. He is currently busy. I will inform him that you messaged."
-        
+# Track which senders we have already replied to this session
+# key = sender string  →  value = timestamp of last reply
+_replied: dict[str, float] = {}
+# Minimum seconds before re-replying to the same sender
+_REPLY_COOLDOWN = 120
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_wa_hwnd() -> int | None:
+    """Return the HWND of the WhatsApp Chromium window, or None."""
+    if not _WIN32_OK:
+        return None
+    found = []
+    def _cb(hwnd, _):
+        title = _win32gui.GetWindowText(hwnd)
+        cls   = _win32gui.GetClassName(hwnd)
+        if "WhatsApp" in title and cls == "Chrome_WidgetWin_1":
+            found.append(hwnd)
+    _win32gui.EnumWindows(_cb, None)
+    return found[0] if found else None
+
+
+def _get_unread_chats(hwnd: int) -> list[dict]:
+    """
+    Scan the WhatsApp UIA tree and return unread chats.
+    Each entry: {"sender": str, "message": str, "count": int}
+    Must be called from a COM-initialised thread.
+    """
+    if not _UIA_OK:
+        return []
     try:
-        # Load API key from config
-        config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        api_key = cfg.get("gemini_api_key")
-        
-        if not api_key:
-            raise ValueError("No Gemini API Key found.")
-            
-        client = genai.Client(api_key=api_key)
-        
-        prompt = (
-            f"You are Jarvis, Deepak's personal AI assistant. Deepak is currently busy working. "
-            f"You received a WhatsApp message from '{sender}' which says: '{message}'. "
-            f"Write a short, natural, and polite reply on Deepak's behalf. "
-            f"Acknowledge what they said. If it is an important update (like a meeting, emergency, or request), "
-            f"tell them you will convey it to Deepak immediately. "
-            f"Keep it under 2 sentences. Reply directly as Jarvis."
-        )
-        
-        response = client.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=prompt
-        )
-        return response.text.strip()
-    except Exception as e:
-        print(f"[WhatsApp Monitor] AI generation failed: {e}")
-        return f"Hello, I am Jarvis. Deepak is currently busy, but I will convey your message to him."
+        # Ensure COM is initialised for this thread (safe to call multiple times)
+        with _auto.UIAutomationInitializerInThread():
+            ctrl = _auto.ControlFromHandle(hwnd)
+            grid = ctrl.DataGridControl(Name="Chat list", searchDepth=25)
+            if not grid.Exists(0.3):
+                return []
 
-async def _get_whatsapp_notifications():
-    if not _WINSDK_AVAILABLE:
-        return []
-        
-    listener = UserNotificationListener.current
-    access = await listener.request_access_async()
-    
-    if access != 1:  # 1 means Allowed
-        print("[WhatsApp Monitor] Windows Notification access denied by user/system.")
-        return []
-        
-    notifs = await listener.get_notifications_async(NotificationKinds.TOAST)
-    
-    results = []
-    for n in notifs:
-        try:
-            app_name = n.app_info.display_info.display_name
-            if "WhatsApp" in app_name:
-                bindings = n.notification.visual.bindings
-                texts = []
-                for b in bindings:
-                    for t in b.get_text_elements():
-                        texts.append(t.text)
-                
-                if texts:
-                    results.append({
-                        "id": n.id,
-                        "sender": texts[0],
-                        "message": texts[1] if len(texts) > 1 else "",
-                    })
-        except Exception as e:
-            pass
-            
-    return results
+            results = []
+            seen: set[str] = set()
 
-def _whatsapp_monitor_loop(player):
-    global _monitoring_active, _replied_notification_ids
-    
-    print("[WhatsApp Monitor] Background thread started with Dynamic AI Replies.")
-    
+            for item in grid.GetChildren():
+                raw = (item.Name or "").strip()
+                if not raw or raw in seen:
+                    continue
+                seen.add(raw)
+
+                # Pattern: "N unread message(s)  <Sender>  HH:MM am/pm  <preview>"
+                m = re.match(
+                    r"^(\d+)\s+unread\s+messages?\s+(.+?)\s+\d+:\d+\s*(?:am|pm)\s+(.*)",
+                    raw,
+                    re.IGNORECASE,
+                )
+                if not m:
+                    continue
+
+                count  = int(m.group(1))
+                sender = m.group(2).strip()
+                rest   = m.group(3).strip()
+
+                # Group chats: rest starts with "~Name:\xa0 message"
+                grp = re.match(r"^~?[^:]+:\xa0?\s*(.*)", rest)
+                message = grp.group(1).strip() if grp else rest
+
+                # Clean non-breaking spaces
+                message = message.replace("\xa0", " ").strip()
+                sender  = sender.replace("\xa0", " ").strip()
+
+                results.append({"sender": sender, "message": message, "count": count})
+
+            return results
+
+    except Exception as exc:
+        print(f"[WhatsApp Monitor] UIA scan error: {exc}")
+        return []
+
+
+def _generate_reply(sender: str, message: str, instruction: str) -> str:
+    """Generate a contextual reply via Gemini, falling back to a static string."""
+    # Load user name from config
+    config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
+    user_name = "the user"
+    api_key   = ""
+    try:
+        cfg       = json.loads(config_path.read_text(encoding="utf-8"))
+        api_key   = cfg.get("gemini_api_key", "").strip()
+        user_name = (cfg.get("user_name") or cfg.get("assistant_name") or "the user").strip()
+    except Exception:
+        pass
+
+    fallback = f"Hi, I'm JARVIS, {user_name}'s AI assistant. {user_name} is currently busy and will get back to you soon."
+
+    if not _GENAI_OK or not api_key:
+        return fallback
+
+    # Build the instruction clause
+    if instruction:
+        instr_clause = instruction.strip().rstrip(".")
+    else:
+        instr_clause = f"{user_name} is currently busy"
+
+    prompt = (
+        f"You are JARVIS, {user_name}'s personal AI assistant. "
+        f"You received a WhatsApp message from '{sender}': \"{message}\". "
+        f"Instruction: {instr_clause}. "
+        f"Write a short, natural, polite reply on {user_name}'s behalf. "
+        f"Acknowledge what they said if relevant. "
+        f"Keep it under 2 sentences. Reply directly — no preamble."
+    )
+
+    try:
+        import warnings
+        client   = _genai.Client(api_key=api_key)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+        return (response.text or "").strip() or fallback
+    except Exception as exc:
+        print(f"[WhatsApp Monitor] Gemini reply error: {exc}")
+        return fallback
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Monitor loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _monitor_loop(player, instruction: str) -> None:
+    global _monitoring_active
+
+    print("[WhatsApp Monitor] ▶ Started (UIA mode).")
     if player:
         try:
-            player.write_log("JARVIS: WhatsApp auto-reply with Smart AI is now active.")
+            player.write_log("JARVIS: WhatsApp auto-reply monitor is now active.")
         except Exception:
             pass
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    hwnd: int | None = None
 
-    while _monitoring_active:
-        if _WINSDK_AVAILABLE and _send_whatsapp:
-            try:
-                notifications = loop.run_until_complete(_get_whatsapp_notifications())
-                
-                for notif in notifications:
-                    notif_id = notif["id"]
-                    sender = notif["sender"]
-                    message = notif["message"]
-                    
-                    if notif_id not in _replied_notification_ids:
-                        _replied_notification_ids.add(notif_id)
-                        
-                        print(f"[WhatsApp Monitor] New message from {sender}: {message}")
-                        
-                        # 1. Generate Smart Reply
-                        reply_text = _generate_dynamic_reply(sender, message)
-                        
-                        # 2. Open WhatsApp and send
-                        result_status = _send_whatsapp(sender, reply_text)
-                        
-                        # 3. Unfocus the chat so follow-up messages trigger notifications again!
+    while not _stop_event.is_set():
+        try:
+            # Re-locate the window every cycle (handles WhatsApp restarts)
+            hwnd = _get_wa_hwnd()
+            if hwnd is None:
+                time.sleep(5)
+                continue
+
+            unread = _get_unread_chats(hwnd)
+
+            for chat in unread:
+                sender  = chat["sender"]
+                message = chat["message"]
+                now     = time.time()
+
+                # Skip if we replied to this sender recently
+                last = _replied.get(sender, 0)
+                if now - last < _REPLY_COOLDOWN:
+                    continue
+
+                _replied[sender] = now
+                print(f"[WhatsApp Monitor] 📩 New message from '{sender}': {message[:60]}")
+
+                # Generate reply
+                reply = _generate_reply(sender, message, instruction)
+                print(f"[WhatsApp Monitor] 📤 Replying: {reply[:80]}")
+
+                # Send via WhatsApp desktop
+                if _SEND_OK:
+                    try:
+                        result = _send_whatsapp(sender, reply)
+                        print(f"[WhatsApp Monitor] ✅ {result}")
+                    except Exception as send_err:
+                        print(f"[WhatsApp Monitor] ❌ Send failed: {send_err}")
+                else:
+                    print("[WhatsApp Monitor] ⚠️ send_message not available.")
+
+                # Notify the user via JARVIS voice
+                alert = (
+                    f"Sir, '{sender}' sent you a message: \"{message[:80]}\". "
+                    f"I replied: \"{reply[:80]}\""
+                )
+                if player:
+                    try:
+                        player.write_log(f"JARVIS: 📨 {alert}")
+                    except Exception:
+                        pass
+                    # Speak alert through active Gemini session if possible
+                    if hasattr(player, "request_say") and callable(player.request_say):
                         try:
-                            import pyautogui
-                            time.sleep(1)
-                            pyautogui.press('esc')  # Deselect the chat
-                            time.sleep(0.5)
-                            pyautogui.hotkey('win', 'down') # Minimize the window
-                        except Exception as e:
-                            print(f"[WhatsApp Monitor] Could not minimize window: {e}")
-                        
-                        # 4. Notify Deepak via JARVIS UI
-                        alert_msg = f"Sir, '{sender}' sent you a message: '{message}'. I replied with: '{reply_text}'"
-                        if player:
-                            player.write_log(f"JARVIS: 📨 {alert_msg}")
-                            # Writing twice to make sure it's prominent in the UI logs
-                            print(f"[JARVIS UI ALERT] {alert_msg}")
-                            
-                            # 5. INJECT into Jarvis's Brain (LLM Context) so he remembers it!
-                            if hasattr(player, 'on_text_command') and callable(player.on_text_command):
-                                internal_memory = (
-                                    f"[SYSTEM_ALERT] You just automatically replied to a WhatsApp message in the background.\n"
-                                    f"Sender: {sender}\n"
-                                    f"Their message: {message}\n"
-                                    f"Your reply: {reply_text}\n\n"
-                                    f"Keep this in your memory. DO NOT speak or reply to this alert out loud unless Deepak explicitly asks if you sent any messages."
-                                )
-                                try:
-                                    player.on_text_command(internal_memory)
-                                except Exception as e:
-                                    print(f"[WhatsApp Monitor] Failed to update Jarvis memory: {e}")
-                            
-            except Exception as e:
-                print(f"[WhatsApp Monitor] Error processing notifications: {e}")
-        else:
-            time.sleep(5)
-            
-        time.sleep(3)
+                            player.request_say(
+                                f"New WhatsApp message from {sender}. I have replied on your behalf."
+                            )
+                        except Exception:
+                            pass
 
-    loop.close()
-    print("[WhatsApp Monitor] Background thread stopped.")
+        except Exception as loop_err:
+            print(f"[WhatsApp Monitor] Loop error: {loop_err}")
+
+        _stop_event.wait(timeout=3)  # poll every 3 seconds
+
+    print("[WhatsApp Monitor] ■ Stopped.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plugin entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run(parameters: dict, player=None, session_memory=None) -> str:
     global _monitor_thread, _monitoring_active
-    
-    status = parameters.get("status", "off").lower()
-    
+
+    status      = parameters.get("status", "off").strip().lower()
+    instruction = parameters.get("reply_instruction", "").strip()
+
+    # ── Start ────────────────────────────────────────────────────────────────
     if status == "on":
         if _monitoring_active:
-            return "WhatsApp smart auto-reply is already monitoring."
-            
+            return "WhatsApp monitor is already running."
+
+        # Dependency checks
+        missing = []
+        if not _WIN32_OK:
+            missing.append("pywin32")
+        if not _UIA_OK:
+            missing.append("uiautomation")
+        if not _SEND_OK:
+            missing.append("pyautogui / pyperclip")
+        if missing:
+            return (
+                f"Cannot start — missing packages: {', '.join(missing)}. "
+                f"Run: pip install {' '.join(missing)}"
+            )
+
+        if _get_wa_hwnd() is None:
+            return (
+                "WhatsApp Desktop is not open. "
+                "Please open WhatsApp Desktop first, then ask me to start the monitor."
+            )
+
+        _stop_event.clear()
+        _replied.clear()
         _monitoring_active = True
+
         _monitor_thread = threading.Thread(
-            target=_whatsapp_monitor_loop,
-            args=(player,),
-            daemon=True
+            target=_monitor_loop,
+            args=(player, instruction),
+            daemon=True,
         )
         _monitor_thread.start()
-        
-        missing_libs = []
-        if not _WINSDK_AVAILABLE:
-            missing_libs.append("winsdk")
-        if not _GENAI_AVAILABLE:
-            missing_libs.append("google-generativeai")
-            
-        if missing_libs:
-            return f"Monitoring started, but missing libraries: {', '.join(missing_libs)}. Run pip install."
-            
-        return "WhatsApp smart auto-reply enabled. I will read incoming messages, think of a contextual reply, and send it on your behalf."
-        
+
+        instr_note = f" I will {instruction}." if instruction else ""
+        return (
+            f"WhatsApp monitor is now active.{instr_note} "
+            f"I will scan for new messages every 3 seconds and reply automatically."
+        )
+
+    # ── Stop ─────────────────────────────────────────────────────────────────
     elif status == "off":
         if not _monitoring_active:
-            return "WhatsApp monitoring is already off."
-            
+            return "WhatsApp monitor is not running."
+
+        _stop_event.set()
         _monitoring_active = False
-        return "I have stopped monitoring WhatsApp."
-        
+
+        if _monitor_thread and _monitor_thread.is_alive():
+            _monitor_thread.join(timeout=5)
+
+        return "WhatsApp monitor stopped. I will no longer auto-reply to messages."
+
     return "Invalid status. Use 'on' or 'off'."

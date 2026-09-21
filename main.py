@@ -1,4 +1,5 @@
 import platform as _platform
+import socket as _socket
 import subprocess as _subprocess
 import sys as _sys
 
@@ -17,6 +18,15 @@ for _stream in (_sys.stdout, _sys.stderr):
 # ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
 # This patches Popen itself, so no per-file flag is needed anywhere.
 if _platform.system() == "Windows":
+    _orig_getaddrinfo = _socket.getaddrinfo
+
+    def _ipv4_first_getaddrinfo(host, port, *args, **kwargs):
+        addresses = _orig_getaddrinfo(host, port, *args, **kwargs)
+        ipv4 = [address for address in addresses if address[0] == _socket.AF_INET]
+        return ipv4 + [address for address in addresses if address[0] != _socket.AF_INET]
+
+    _socket.getaddrinfo = _ipv4_first_getaddrinfo
+
     _OrigPopen = _subprocess.Popen
 
     class _Popen(_OrigPopen):
@@ -70,9 +80,13 @@ from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
+from actions.routines          import RoutineRunner
 from actions.web_search        import _news as _fetch_news_sync
+from actions.app_tracker       import AppTracker, get_usage_tool
+from actions.wake_word         import WakeWordDetector
 from memory.config_manager     import get_brief_enabled
 from core.plugin_loader        import discover_plugins
+from core.llm_client           import call_llm
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -82,7 +96,7 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-latest"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -101,9 +115,38 @@ def _load_system_prompt() -> str:
             "You are JARVIS, Tony Stark's AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
+            "you can attack or defent the security, as your name jarvis be creative and use the tools to your advantage"
+            "you are an advance machine,you help tony's work and system protect from malware attack"
+            "you are well develop in ethicial hacking system "
         )
 
+# ── Cached static parts of the session config — only rebuilt on actual change ─
+_cached_sys_prompt:    str   = ""
+_cached_api_cfg_mtime: float = 0.0
+_cached_asst_name:     str   = "JARVIS"
+_cached_user_name:     str   = ""
+
+def _get_static_config() -> tuple[str, str, str]:
+    """Return (system_prompt_text, assistant_name, user_name).
+    Re-reads prompt.txt and api_keys.json only when the files have changed.
+    """
+    global _cached_sys_prompt, _cached_api_cfg_mtime, _cached_asst_name, _cached_user_name
+    try:
+        mtime = API_CONFIG_PATH.stat().st_mtime
+        if mtime != _cached_api_cfg_mtime:
+            _cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+            _cached_asst_name     = (_cfg.get("assistant_name") or "JARVIS").strip()
+            _cached_user_name     = (_cfg.get("user_name") or "").strip()
+            _cached_api_cfg_mtime = mtime
+    except Exception:
+        pass
+    if not _cached_sys_prompt:
+        _cached_sys_prompt = _load_system_prompt()
+    return _cached_sys_prompt, _cached_asst_name, _cached_user_name
+
+
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
+
 
 def _clean_transcript(text: str) -> str:    
     text = _CTRL_RE.sub("", text)
@@ -249,15 +292,20 @@ TOOL_DECLARATIONS = [
         "description": (
             "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
             "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
-            "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
+            "sleep/suspend, lock screen, screenshots (show on dashboard), scrolling, tab management, "
+            "zoom, refresh/reload page, and battery status. "
+            "Actions: battery/battery_status, sleep/suspend/hibernate, lock_screen, shutdown, restart, "
+            "screenshot (opens OS snip), screenshot_dashboard (takes screenshot and shows on web dashboard), "
+            "volume_up/down/mute, brightness_up/down, sleep_display, dark_mode, toggle_wifi, and more. "
             "Use for ANY single computer control command."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform"},
+                "action":      {"type": "STRING", "description": "The action to perform. For battery: 'battery_status'. For sleep: 'sleep'. For screenshot on dashboard: 'screenshot_dashboard'."},
                 "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
+                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."},
+                "confirmed":   {"type": "STRING", "description": "Pass 'yes' to confirm dangerous actions (shutdown, restart, sleep)"}
             },
             "required": []
         }
@@ -558,6 +606,40 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "app_usage",
+        "description": (
+            "Reports app usage and productivity stats, or controls focus mode. "
+            "Use when the user asks: 'what apps did I use today', "
+            "'show my productivity stats', 'how much time did I spend on...', "
+            "'start focus mode', 'stop focus mode', 'what am I running right now'."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": (
+                        "report — full time-per-app breakdown | "
+                        "category_report — grouped by category (Coding, Social Media, etc.) | "
+                        "focus — enable focus mode for specific apps | "
+                        "clear_focus — disable focus mode | "
+                        "current — which app is in focus right now"
+                    ),
+                },
+                "period": {
+                    "type": "STRING",
+                    "description": "today | week | session  (default: today)",
+                },
+                "apps": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "App names for focus mode (e.g. ['Visual Studio Code', 'Terminal'])",
+                },
+            },
+            "required": ["action"],
+        },
+    },
 ]
 
 class JarvisLive:
@@ -588,6 +670,15 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._routine_runner = RoutineRunner(self._deliver_routine)
+
+        # ── App usage tracker ─────────────────────────────────────────────────
+        self._app_tracker = AppTracker()
+        self._app_tracker.start()
+
+        # ── Wake word detector ────────────────────────────────────────────────
+        self._wake_detector = WakeWordDetector()
+        self._wake_word_armed = True   # False while JARVIS is speaking (avoid self-trigger)
 
         self._enhanced_live = True  # affective dialog + proactive audio; auto-disabled if the server rejects them
         _core_names = {t["name"] for t in TOOL_DECLARATIONS}
@@ -628,19 +719,41 @@ class JarvisLive:
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
+        # Generate one-time phone pairing session
+        qr_content = ""
+        pair_token = ""
+        ws_url = ""
+        try:
+            from remote.pairing import pairing_manager
+            pair_sess = pairing_manager.create_pairing_session()
+            qr_content = pair_sess["qr_json"]
+            pair_token = pair_sess["pairing_token"]
+            ws_url = pair_sess["gateway_url"]
+        except Exception as e:
+            print(f"[RemotePairing] QR error: {e}")
+
         if self._dashboard is None:
+            if qr_content:
+                return ws_url, pair_token[:8], qr_content, ws_url
             self.ui.write_log(
                 "SYS: Dashboard unavailable. "
                 "Run: pip install fastapi \"uvicorn[standard]\" cryptography"
             )
             return None
+
         key    = self._dashboard.new_key()
         url    = self._dashboard.get_url()
         manual = self._dashboard.get_manual_url()
-        return url, key, f"{url}/auto-login?key={key}", manual
+        # If phone pairing QR is available, encode the pairing JSON into QR
+        qr_target = qr_content if qr_content else f"{url}/auto-login?key={key}"
+        display_key = pair_token[:8].upper() if pair_token else key
+        return url, display_key, qr_target, manual
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
+        if not self._loop:
+            return
+        if not self.session:
+            asyncio.run_coroutine_threadsafe(self._offline_answer(text), self._loop)
             return
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
@@ -650,13 +763,73 @@ class JarvisLive:
             self._loop
         )
 
+    def _ensure_unmuted(self) -> None:
+        """Ensure current process audio session in Windows mixer is unmuted and audible."""
+        try:
+            import os
+            import comtypes
+            try:
+                comtypes.CoInitialize()
+            except Exception:
+                pass
+            from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+            pid = os.getpid()
+            for s in AudioUtilities.GetAllSessions():
+                if s.ProcessId == pid or (s.Process and "python" in s.Process.name().lower()):
+                    vol = s._ctl.QueryInterface(ISimpleAudioVolume)
+                    vol.SetMute(0, None)
+        except Exception:
+            pass
+
+    async def _offline_answer(self, text: str) -> None:
+        """Answer text commands through Ollama while Gemini Live is offline."""
+        try:
+            result = await asyncio.to_thread(call_llm, [
+                {"role": "system", "content": "You are JARVIS in offline mode. Be concise and say when an action needs online tools."},
+                {"role": "user", "content": text},
+            ])
+            answer = result.get("content") or "Offline mode is ready, but Ollama returned no text."
+        except Exception as exc:
+            answer = f"Offline mode is unavailable: {exc}"
+        self.ui.write_log(f"{self._asst_name}: {answer}")
+        if self._dashboard:
+            await self._dashboard.broadcast({"type": "log", "speaker": "jarvis", "text": answer})
+
+    def _deliver_routine(self, text: str) -> None:
+        """Deliver a scheduled briefing to Gemini, or Ollama if Gemini is down."""
+        if not self._loop:
+            return
+
+        async def _deliver():
+            if self.session:
+                try:
+                    await self.session.send_client_content(
+                        turns={"parts": [{"text": text + " Read this briefing aloud briefly."}]},
+                        turn_complete=True,
+                    )
+                    return
+                except Exception:
+                    pass
+            await self._offline_answer(text)
+
+        asyncio.run_coroutine_threadsafe(_deliver(), self._loop)
+
     def set_speaking(self, value: bool):
         with self._speaking_lock:
             self._is_speaking = value
+        # Disarm wake word while JARVIS is speaking to prevent self-trigger
+        self._wake_word_armed = not value
         if value:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
+        # Keep HUD in sync
+        try:
+            from plugins.hud_overlay import update_hud_state
+            update_hud_state("SPEAKING" if value else
+                             ("MUTED" if self.ui.muted else "LISTENING"))
+        except Exception:
+            pass
 
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
@@ -696,18 +869,12 @@ class JarvisLive:
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
 
-        # Load customization from config
-        try:
-            _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
-            self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
-            _user_name = (_cfg.get("user_name") or "").strip()
-        except Exception:
-            self._asst_name = "JARVIS"
-            _user_name = ""
+        # Use cached static parts — avoids file I/O on every reconnect
+        sys_prompt, asst_name, _user_name = _get_static_config()
+        self._asst_name = asst_name
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
-        sys_prompt = _load_system_prompt()
 
         now      = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
@@ -717,16 +884,20 @@ class JarvisLive:
             f"Use this to calculate exact times for reminders.\n\n"
         )
 
-        # Identity injection — overrides any hardcoded name in prompt.txt
+        # Identity & Language injection — overrides any hardcoded name in prompt.txt
         _addr = (f"ADDRESS: Always call the user '{_user_name}'."
                  if _user_name
-                 else "ADDRESS: When speaking Turkish → always say \"efendim\". "
-                      "When speaking English → say \"sir\". Never mix languages.")
+                 else "ADDRESS: When speaking English → say 'sir'. "
+                      "When speaking Tamil → say 'ஐயா' or 'சார்'. "
+                      "When speaking Malayalam → say 'സാർ'.")
         identity_ctx = (
-            f"[IDENTITY]\n"
+            f"[IDENTITY & MULTILINGUAL RULES]\n"
             f"Your name is {self._asst_name}. "
             f"Always refer to yourself as {self._asst_name}.\n"
-            f"{_addr}\n\n"
+            f"{_addr}\n"
+            f"PRIMARY LANGUAGES: Tamil (தமிழ்), English, and Malayalam (മലയാളം).\n"
+            f"CRITICAL: Always detect the language the user speaks (Tamil, English, or Malayalam) "
+            f"and respond in that exact same language. Dynamically switch language turn-by-turn with the user.\n\n"
         )
 
         parts = [time_ctx, identity_ctx]
@@ -741,6 +912,14 @@ class JarvisLive:
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()}],
             session_resumption=types.SessionResumptionConfig(),
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    silence_duration_ms=500,
+                    prefix_padding_ms=100,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                )
+            ),
             # Sliding-window compression: session never dies from a full context
             # window — JARVIS can stay in one conversation for hours
             context_window_compression=types.ContextWindowCompressionConfig(
@@ -851,7 +1030,13 @@ class JarvisLive:
                 result = "Camera closed."
 
             elif name == "computer_settings":
-                r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: computer_settings(
+                        parameters=args, response=None,
+                        player=self.ui, dashboard=self._dashboard
+                    )
+                )
                 result = r or "Done."
 
             elif name == "desktop_control":
@@ -913,6 +1098,16 @@ class JarvisLive:
                 else:
                     result = "Specify action (add/remove/list) and a topic."
 
+            elif name == "app_usage":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: get_usage_tool(args, tracker=self._app_tracker, player=self.ui),
+                )
+                result = r or "No data."
+                # Mirror a full report to the UI content panel
+                if args.get("action", "").lower() in ("report", "category_report", ""):
+                    self.ui.show_content("APP USAGE — productivity stats", result)
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 async def _do_shutdown():
@@ -957,7 +1152,15 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            chunks = [msg["data"]]
+            while not self.out_queue.empty():
+                try:
+                    next_msg = self.out_queue.get_nowait()
+                    chunks.append(next_msg["data"])
+                except Exception:
+                    break
+            combined = b"".join(chunks)
+            await self.session.send_realtime_input(media={"data": combined, "mime_type": "audio/pcm"})
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
@@ -968,10 +1171,13 @@ class JarvisLive:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+                item = {"data": data, "mime_type": "audio/pcm"}
+                def _safe_put(q=self.out_queue, v=item):
+                    try:
+                        q.put_nowait(v)
+                    except asyncio.QueueFull:
+                        pass  # drop frame — queue will catch up
+                loop.call_soon_threadsafe(_safe_put)
 
         try:
             with sd.InputStream(
@@ -996,7 +1202,27 @@ class JarvisLive:
             while True:
                 async for response in self.session.receive():
 
+                    _audio_data = None
                     if response.data:
+                        _audio_data = response.data
+                    elif response.server_content and response.server_content.model_turn:
+                        parts = response.server_content.model_turn.parts or []
+                        raw_chunks = []
+                        for p in parts:
+                            if hasattr(p, "inline_data") and p.inline_data and p.inline_data.data:
+                                d = p.inline_data.data
+                                if isinstance(d, bytes):
+                                    raw_chunks.append(d)
+                                elif isinstance(d, str):
+                                    import base64
+                                    try:
+                                        raw_chunks.append(base64.b64decode(d))
+                                    except Exception:
+                                        pass
+                        if raw_chunks:
+                            _audio_data = b"".join(raw_chunks)
+
+                    if _audio_data:
                         if self._interrupted:
                             pass  # discard: interrupted
                         else:
@@ -1004,10 +1230,12 @@ class JarvisLive:
                                 self._turn_done_event.clear()
                             # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
                             # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
-                            _audio_data = response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
-                                self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
+                                try:
+                                    self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
+                                except asyncio.QueueFull:
+                                    pass  # speaker queue full — drop oldest chunk
 
                     if response.server_content:
                         sc = response.server_content
@@ -1091,13 +1319,13 @@ class JarvisLive:
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
+                        # Execute independent tool calls concurrently
+                        fn_responses = await asyncio.gather(*[
+                            self._execute_tool(fc)
+                            for fc in response.tool_call.function_calls
+                        ])
                         await self.session.send_tool_response(
-                            function_responses=fn_responses
+                            function_responses=list(fn_responses)
                         )
         except Exception as e:
             print(f"[JARVIS] ❌ Recv: {e}")
@@ -1106,6 +1334,12 @@ class JarvisLive:
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
+
+        # Ensure Python process is not muted in Windows Volume Mixer
+        try:
+            await asyncio.to_thread(self._ensure_unmuted)
+        except Exception:
+            pass
 
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
@@ -1187,7 +1421,10 @@ class JarvisLive:
             return
 
         # ── Phase 1: instant greeting ─────────────────────────────────────────
-        lang_clause = f" Respond in {lang}." if lang else ""
+        if not lang or "," in lang or "dynamic" in lang.lower():
+            lang_clause = " Respond in English."
+        else:
+            lang_clause = f" Respond in {lang}."
         name_clause = f" Address the user as {name}." if name else ""
 
         # Inject last session context if available — pop removes it so it's never repeated
@@ -1221,7 +1458,10 @@ class JarvisLive:
         # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
         async def _deliver_news():
             try:
-                lang_str = f" Respond in {lang}." if lang else ""
+                if not lang or "," in lang or "dynamic" in lang.lower():
+                    lang_str = " Respond in English."
+                else:
+                    lang_str = f" Respond in {lang}."
 
                 # Wait for news fetch (already running) and Phase 1 turn-complete
                 # in parallel — whichever takes longer determines the wait time
@@ -1296,11 +1536,14 @@ class JarvisLive:
         memory = load_memory()
         lang_entry = memory.get("identity", {}).get("language", {})
         lang = (lang_entry.get("value", "") if isinstance(lang_entry, dict) else str(lang_entry)).strip()
-        lang = lang or "English"
+        if not lang or "," in lang or "dynamic" in lang.lower():
+            summary_lang = "the primary language used in the conversation"
+        else:
+            summary_lang = lang
 
         convo = "\n".join(log[-40:])   # cap at last 40 turns to stay within token budget
         prompt = (
-            f"Summarize this conversation in 1-2 sentences in {lang}. "
+            f"Summarize this conversation in 1-2 sentences in {summary_lang}. "
             "Focus on what the user accomplished or discussed. "
             "Output ONLY the summary text, nothing else:\n\n" + convo
         )
@@ -1414,6 +1657,99 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
 
+    # ── App usage alert monitor ─────────────────────────────────────────────────
+
+    async def _run_usage_alerts(self) -> None:
+        """
+        Periodically check AppTracker for productivity alert thresholds.
+        If the user has spent too long on distracting apps, whisper it to Gemini
+        so JARVIS can mention it naturally in the user's language.
+        """
+        await asyncio.sleep(120)   # wait 2 min after startup
+        while True:
+            await asyncio.sleep(300)   # check every 5 minutes
+
+            if not self.session:
+                continue
+
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking or (time.monotonic() - self._last_user_speech) < 15:
+                continue
+
+            try:
+                alert = await asyncio.to_thread(self._app_tracker.get_session_alert)
+                if alert:
+                    memory  = await asyncio.to_thread(load_memory)
+                    lang_e  = memory.get("identity", {}).get("language", {})
+                    lang    = (lang_e.get("value", "") if isinstance(lang_e, dict) else str(lang_e)).strip() or "English"
+                    msg = (
+                        f"{alert}\n\n"
+                        f"Mention this gently once in {lang}. "
+                        "Do not nag. One brief, natural sentence."
+                    )
+                    await self.session.send_client_content(
+                        turns={"parts": [{"text": msg}]},
+                        turn_complete=True,
+                    )
+                    self.ui.write_log("SYS: Usage alert sent.")
+            except Exception as e:
+                print(f"[UsageAlert] ⚠️ {e}")
+
+    # ── Wake word listener ──────────────────────────────────────────────────────
+
+    def _start_wake_word(self) -> None:
+        """
+        Start the wake word detector.  The callback unmutes the mic and wakes
+        JARVIS if it is currently muted/idle — identical to pressing the button.
+        """
+        def _on_wake():
+            if not self._wake_word_armed:
+                return   # JARVIS is speaking — ignore self-activation
+            # If already listening and not muted, do not interrupt live conversation
+            if hasattr(self.ui, "muted") and not self.ui.muted:
+                return
+            print("[WakeWord] 🔔 Activating JARVIS...")
+            self.ui.write_log("SYS: Wake word detected — activating.")
+            # If the UI mic is muted, unmute it
+            if hasattr(self.ui, "muted") and self.ui.muted:
+                try:
+                    self.ui.toggle_mute()   # unmute so the next words are heard
+                except Exception:
+                    pass
+            # Send a gentle wake acknowledgement so JARVIS speaks immediately
+            if self.session and self._loop:
+                memory  = load_memory()
+                lang_e  = memory.get("identity", {}).get("language", {})
+                lang    = (lang_e.get("value", "") if isinstance(lang_e, dict) else str(lang_e)).strip() or "English"
+                wake_msg = (
+                    f"The user just activated you via wake word. "
+                    f"Give a brief, natural ready-acknowledgement in {lang} "
+                    f"(e.g. 'Yes, sir?' / 'Efendim?'). "
+                    "One phrase only. Do not call any tools."
+                )
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.session.send_client_content(
+                            turns={"parts": [{"text": wake_msg}]},
+                            turn_complete=True,
+                        ),
+                        self._loop,
+                    )
+                except Exception as e:
+                    print(f"[WakeWord] Session send error: {e}")
+
+        if self._wake_detector.start(_on_wake):
+            self.ui.write_log(
+                f"SYS: Wake word detection active "
+                f"(backend: {self._wake_detector.backend_name}). Say 'Hey JARVIS'."
+            )
+        else:
+            self.ui.write_log(
+                "SYS: Wake word detection disabled or failed to start. "
+                "Install openwakeword:  pip install openwakeword"
+            )
+
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
     async def _relay_phone_audio(self) -> None:
@@ -1461,7 +1797,7 @@ class JarvisLive:
                     )
                     self.ui.write_log(f"[Web]: {text}")
                 else:
-                    print(f"[Dashboard] Dropped command (no session): {text}")
+                    await self._offline_answer(text)
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
@@ -1478,12 +1814,37 @@ class JarvisLive:
             from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
+            self._dashboard.set_plugin_registry(self._plugin_registry)
+            self._dashboard.set_routine_callback(self._deliver_routine)
             asyncio.create_task(self._dashboard.serve())
             # Runs for the whole lifetime, not just inside an active session
             asyncio.create_task(self._process_dashboard_commands())
+            self._routine_runner.start()
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
+
+        # Start Mobile Remote Gateway
+        try:
+            from remote.gateway import RemoteGateway
+            self._remote_gateway = RemoteGateway(orchestrator=self)
+            asyncio.create_task(self._remote_gateway.serve())
+            self.ui.write_log("SYS: Mobile Remote Gateway active.")
+        except Exception as e:
+            print(f"[RemoteGateway] Disabled: {e}")
+            self._remote_gateway = None
+
+        # Start wake word detector (runs independently of the session)
+        self._start_wake_word()
+
+        # Start Telegram bridge uplink (if enabled and configured)
+        try:
+            from plugins.telegram_bridge import TelegramBridge
+            from memory.config_manager import get_plugin_enabled
+            if get_plugin_enabled("telegram_bridge"):
+                TelegramBridge.get_instance().start(player=self.ui)
+        except Exception as e:
+            print(f"[TelegramBridge] Startup notice: {e}")
 
         while True:
             try:
@@ -1499,10 +1860,7 @@ class JarvisLive:
                     http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
                 )
 
-                async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
-                    asyncio.TaskGroup() as tg,
-                ):
+                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
                     self.session          = session
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
@@ -1523,20 +1881,31 @@ class JarvisLive:
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
-                    tg.create_task(self._send_realtime())
-                    tg.create_task(self._listen_audio())
-                    tg.create_task(self._receive_audio())
-                    tg.create_task(self._play_audio())
-                    tg.create_task(self._run_system_monitor())
-                    tg.create_task(self._run_background_monitor())
-                    tg.create_task(self._run_proactive_mode())
+                    tasks = [
+                        asyncio.create_task(self._send_realtime()),
+                        asyncio.create_task(self._listen_audio()),
+                        asyncio.create_task(self._receive_audio()),
+                        asyncio.create_task(self._play_audio()),
+                        asyncio.create_task(self._run_system_monitor()),
+                        asyncio.create_task(self._run_background_monitor()),
+                        asyncio.create_task(self._run_proactive_mode()),
+                        asyncio.create_task(self._run_usage_alerts()),
+                    ]
                     if self._dashboard:
-                        tg.create_task(self._relay_phone_audio())
+                        tasks.append(asyncio.create_task(self._relay_phone_audio()))
 
                     # Morning briefing — fires once per process launch (if enabled)
                     if not self._briefing_sent and get_brief_enabled():
                         self._briefing_sent = True
-                        tg.create_task(self._send_startup_briefing())
+                        tasks.append(asyncio.create_task(self._send_startup_briefing()))
+
+                    try:
+                        await asyncio.gather(*tasks)
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
 
             except KeyboardInterrupt:
                 raise

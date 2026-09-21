@@ -625,10 +625,27 @@ class _BrowserSession:
 
 
     async def _get_page(self) -> Page:
-        await self._launch()
-        # If somehow page got closed, open a fresh one
+        # ── Detect stale context (browser closed externally) ──────────────────
+        context_alive = False
+        if self._context is not None:
+            try:
+                # Cheapest possible check: accessing .pages raises if context is dead
+                _ = self._context.pages
+                context_alive = True
+            except Exception:
+                print(f"[Browser] Context for '{self.browser_name}' was closed externally — re-launching.")
+                self._context = None
+                self._page    = None
+
+        await self._launch()   # no-op if context already alive after check
+
+        # ── Detect stale page ─────────────────────────────────────────────────
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+            pages = self._context.pages if self._context else []
+            if pages:
+                self._page = pages[-1]   # reuse last open tab
+            else:
+                self._page = await self._context.new_page()
             await asyncio.sleep(0.2)
         return self._page
 
@@ -639,18 +656,35 @@ class _BrowserSession:
         prev_url = page.url
 
         async def _do_goto(p: Page) -> str:
-            """Attempt navigation and return the resulting URL (may still be blank)."""
+            """Attempt navigation and return the resulting URL."""
             try:
                 await p.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 await asyncio.sleep(0.3)
             except PlaywrightTimeout:
                 pass   # page may have partially loaded — check URL below
             except Exception as e:
-                print(f"[Browser] goto exception (non-fatal): {e}")
+                raise   # propagate so outer handler can retry
             return p.url
 
-        result_url = await _do_goto(page)
+        # First attempt
+        try:
+            result_url = await _do_goto(page)
+        except Exception as e:
+            err = str(e)
+            if "closed" in err.lower() or "target" in err.lower():
+                # Context/page was killed — reset and retry once
+                print(f"[Browser] Page closed during navigation — resetting session and retrying.")
+                self._context = None
+                self._page    = None
+                try:
+                    page = await self._get_page()
+                    result_url = await _do_goto(page)
+                except Exception as e2:
+                    return f"Browser error (go_to): {e2}"
+            else:
+                return f"Browser error (go_to): {e}"
 
+        # If still blank and original page was also blank, retry with new tab
         if result_url in ("about:blank", "", None, prev_url) and prev_url in ("about:blank", "", None):
             print(f"[Browser] Still blank after goto — retrying on new tab: {url}")
             try:
@@ -847,6 +881,7 @@ class _SessionRegistry:
         self._active_browser:  str                        = ""
         self._lock             = threading.Lock()
         self._last_native_url: str                        = ""
+        self._last_native_browser: str                    = ""  # browser used in last native open
 
     def has(self, browser_name: str | None = None) -> bool:
         """Bu tarayıcı için (veya hiç) aktif bir otomasyon oturumu var mı?"""
@@ -856,8 +891,13 @@ class _SessionRegistry:
             name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
             return name in self._sessions
 
-    def note_native_url(self, url: str) -> None:
-        self._last_native_url = url
+    def note_native_url(self, url: str, browser: str = "") -> None:
+        self._last_native_url     = url
+        self._last_native_browser = browser or self._last_native_browser
+
+    def get_last_native_browser(self) -> str:
+        """Return the browser used for the last native navigation (empty = unknown)."""
+        return self._last_native_browser
 
     def pop_native_url(self) -> str:
         """Son native açılan URL'yi bir kez döndürür (tekrarı önlemek için tüketilir)."""
@@ -866,12 +906,19 @@ class _SessionRegistry:
 
     def _get_or_create(self, browser_name: str) -> _BrowserSession:
         with self._lock:
-            if browser_name not in self._sessions:
+            sess = self._sessions.get(browser_name)
+            if sess is not None:
+                # Check if the underlying thread is still alive
+                if sess._thread and not sess._thread.is_alive():
+                    print(f"[Registry] Session thread for '{browser_name}' died — removing.")
+                    del self._sessions[browser_name]
+                    sess = None
+            if sess is None:
                 sess = _BrowserSession(browser_name)
                 sess.start()
                 self._sessions[browser_name] = sess
                 print(f"[Registry] New session: {browser_name}")
-            return self._sessions[browser_name]
+            return sess
 
     def get(self, browser_name: str | None = None) -> _BrowserSession:
         if not browser_name:
@@ -956,15 +1003,25 @@ def browser_control(
         _log(player, result)
         return result
 
-    # ── Gezinme HER ZAMAN native ─────────────────────────────────────────────
-    # go_to / search / new_tab siteyi kullanıcının kendi tarayıcısında açar —
-    # kendi profili, giriş yapılmış hesapları ve açılış sayfasıyla; tıpkı
-    # kullanıcının kendisi açmış gibi. about:blank'li kontrollü pencere burada
-    # asla açılmaz. Tek istisna: hâlihazırda süren bir otomasyon akışı varsa
-    # gezinme o pencerede devam eder (çok adımlı görevler bölünmesin diye).
+    # ── Navigation (go_to / search / new_tab) ────────────────────────────────
+    # If an active Playwright session exists for this browser, use it.
+    # Otherwise open natively in the correct browser (not the OS default).
+    # The last-used browser is remembered so follow-up searches stay in it.
     if action in ("go_to", "search", "new_tab"):
-        if _registry.has(browser):
-            sess = _registry.get(browser)
+
+        # Resolve which browser to use:
+        #   1. Explicitly requested in params
+        #   2. Last browser used natively (keeps context across chained commands)
+        #   3. Active Playwright session
+        #   4. OS default
+        effective_browser = (
+            browser
+            or _registry.get_last_native_browser()
+            or (_registry._active_browser if _registry._active_browser else None)
+        )
+
+        if _registry.has(effective_browser):
+            sess = _registry.get(effective_browser)
             try:
                 if action == "search":
                     result = sess.run(sess.search(params.get("query", ""),
@@ -980,6 +1037,7 @@ def browser_control(
             _log(player, result)
             return result
 
+        # No Playwright session — open natively in the correct browser
         if action == "search":
             base    = _SEARCH_ENGINES.get(params.get("engine", "google").lower(),
                                           _SEARCH_ENGINES["google"])
@@ -987,9 +1045,11 @@ def browser_control(
         else:
             nav_url = params.get("url", "").strip()
 
-        result = _open_native(nav_url, browser)
+        result = _open_native(nav_url, effective_browser)
         if result.startswith("Opened") and nav_url:
-            _registry.note_native_url(_normalize_url(nav_url))
+            # Record both the URL and which browser was used
+            used_browser = effective_browser or _detect_default_browser()
+            _registry.note_native_url(_normalize_url(nav_url), used_browser)
         _log(player, result)
         return result
 
@@ -1047,7 +1107,18 @@ def browser_control(
     except concurrent.futures.TimeoutError:
         result = f"Browser action '{action}' timed out (60s)."
     except Exception as e:
-        result = f"Browser error ({action}): {e}"
+        err = str(e)
+        if "closed" in err.lower() or "target" in err.lower():
+            # Browser was closed externally — drop session and retry once
+            print(f"[Browser] Session closed externally — dropping and retrying.")
+            _registry.close_one(browser or _registry._active_browser)
+            try:
+                sess   = _registry.get(browser)
+                result = sess.run(sess.go_to(params.get("url", "")))
+            except Exception as e2:
+                result = f"Browser error ({action}): {e2}"
+        else:
+            result = f"Browser error ({action}): {e}"
 
     _log(player, result)
     return result

@@ -72,7 +72,7 @@ def _get_api_key() -> str:
 def _get_os() -> str:
     return _load_config().get("os_system", "windows").lower()
 
-_LIVE_MODEL         = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+_LIVE_MODEL         = "models/gemini-2.5-flash-native-audio-latest"
 _CHANNELS           = 1
 _RECEIVE_SAMPLE_RATE = 24_000
 _CHUNK_SIZE         = 1_024
@@ -283,14 +283,21 @@ class _VisionSession:
                     backoff = 2.0  
                     print("[Vision] ✅ Connected")
 
-                    async with asyncio.TaskGroup() as tg:
-                        tg.create_task(self._send_loop())
-                        tg.create_task(self._recv_loop())
-                        tg.create_task(self._play_loop())
+                    tasks = [
+                        asyncio.create_task(self._send_loop()),
+                        asyncio.create_task(self._recv_loop()),
+                        asyncio.create_task(self._play_loop()),
+                    ]
+                    try:
+                        await asyncio.gather(*tasks)
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
 
-            except* Exception as eg:
-                for exc in eg.exceptions:
-                    print(f"[Vision] ⚠️  Session error: {exc}")
+            except Exception as exc:
+                print(f"[Vision] ⚠️  Session error: {exc}")
             finally:
                 self._session = None
                 self._ready_evt.clear()
@@ -320,7 +327,7 @@ class _VisionSession:
                 print(f"[Vision] 📤 Sent {len(image_bytes):,} bytes — '{user_text[:60]}'")
             except Exception as e:
                 print(f"[Vision] ⚠️  Send error: {e}")
-                raise  # propagate to TaskGroup → triggers session reconnect
+                raise  # propagate to the session supervisor for reconnect
 
     async def _recv_loop(self) -> None:
         transcript: list[str] = []

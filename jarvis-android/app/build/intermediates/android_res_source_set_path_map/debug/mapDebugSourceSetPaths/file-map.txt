@@ -1,0 +1,7 @@
+com.jarvis.remote.app-updated_navigation_xml-0 F:\jarvis\jarvis\jarvis-android\app\build\generated\updated_navigation_xml\debug
+com.jarvis.remote.app-packageDebugResources-1 F:\jarvis\jarvis\jarvis-android\app\build\intermediates\incremental\debug\packageDebugResources\merged.dir
+com.jarvis.remote.app-packageDebugResources-2 F:\jarvis\jarvis\jarvis-android\app\build\intermediates\incremental\debug\packageDebugResources\stripped.dir
+com.jarvis.remote.app-debug-3 F:\jarvis\jarvis\jarvis-android\app\build\intermediates\merged_res\debug\mergeDebugResources
+com.jarvis.remote.app-debug-4 F:\jarvis\jarvis\jarvis-android\app\src\debug\res
+com.jarvis.remote.app-main-5 F:\jarvis\jarvis\jarvis-android\app\src\main\res
+gradleHome-0 C:\Users\mgdha\.gradle

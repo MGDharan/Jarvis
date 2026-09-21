@@ -1,0 +1,56 @@
+{
+    "enabled": true,
+    "port": 8765,
+    "host": "0.0.0.0",
+    "pairing_token_expiry_sec": 300,
+    "auth_token_expiry_days": 365,
+    "rate_limit_rpm": 60,
+    "max_transfer_mb": 500,
+    "temp_cleanup_sec": 900,
+    "challenge_expiry_sec": 60,
+    "allowed_directories": [
+        "D:/Projects",
+        "D:/Documents",
+        "D:/Datasets",
+        "F:/jarvis",
+        "C:\\Users\\mgdha\\Documents",
+        "C:\\Users\\mgdha\\Downloads",
+        "C:\\Users\\mgdha\\Desktop",
+        "C:\\Users\\mgdha\\Projects"
+    ],
+    "blocked_directories": [
+        "C:/Windows",
+        "C:/Program Files",
+        "C:/Program Files (x86)",
+        "C:\\Users\\mgdha\\AppData",
+        "F:\\jarvis\\jarvis\\.git",
+        "F:\\jarvis\\jarvis\\config\\certs"
+    ],
+    "blocked_files": [
+        "api_keys.json",
+        ".env",
+        "id_rsa",
+        "id_ed25519",
+        "authorized_devices.json"
+    ],
+    "allowed_applications": [
+        "chrome",
+        "google chrome",
+        "code",
+        "vscode",
+        "visual studio code",
+        "antigravity",
+        "whatsapp",
+        "telegram",
+        "spotify",
+        "terminal",
+        "cmd",
+        "powershell",
+        "vlc",
+        "notepad",
+        "explorer",
+        "edge",
+        "firefox",
+        "brave"
+    ]
+}
